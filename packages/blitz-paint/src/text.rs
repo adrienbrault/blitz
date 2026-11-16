@@ -1,5 +1,6 @@
 use anyrender::{AntiAliasing, PaintScene};
 use blitz_dom::CopyStyleGetters;
+use blitz_dom::text_overflow::{Cut, TextOverflowLayout};
 use blitz_dom::{BaseDocument, NodeId, node::TextBrush};
 use kurbo::{Affine, Rect};
 use parley::{Affinity, Cursor, GlyphRun, Layout, Line, PositionedLayoutItem, Selection};
@@ -92,12 +93,17 @@ pub(crate) struct DrawTextContext {
     win_ascent_ratios: WinAscentCache,
 }
 
+/// An inline root's `text-overflow` record and the `(line index, cut)` of each line it
+/// truncates at the current scroll position, in line order.
+pub(crate) type TextOverflowCuts<'a> = (&'a TextOverflowLayout<TextBrush>, &'a [(usize, Cut)]);
+
 #[derive(Clone, Copy)]
 pub(crate) struct TextPaintOptions {
     pub scale: f64,
     pub brush_override: Option<Color>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stroke_text<'a>(
     scene: &mut impl PaintScene,
     lines: impl Iterator<Item = Line<'a, TextBrush>>,
@@ -106,6 +112,7 @@ pub(crate) fn stroke_text<'a>(
     options: TextPaintOptions,
     inline_root_id: NodeId,
     context: &mut DrawTextContext,
+    text_overflow: Option<TextOverflowCuts<'_>>,
 ) {
     let TextPaintOptions {
         scale,
@@ -130,7 +137,15 @@ pub(crate) fn stroke_text<'a>(
     // ancestor chain on every run, we cache each node's resolved values here and,
     // for each run, only resolve styles for the nodes newly descended into (popping
     // as we ascend). `path_scratch` is a reusable buffer for the run's node path.
-    for line in lines {
+    let mut remaining_cuts = text_overflow
+        .map_or(&[][..], |(_, cuts)| cuts)
+        .iter()
+        .peekable();
+    for (line_index, line) in lines.enumerate() {
+        // `text-overflow`: where this line is cut, if it is truncated.
+        let cut = remaining_cuts
+            .next_if(|(index, _)| *index == line_index)
+            .map(|(_, cut)| *cut);
         // Decorations accumulated for this line, keyed by decorating box, so each box is
         // painted once (spanning all its runs) using its own font — matching Firefox, which
         // draws one decoration per box rather than one stepped segment per differently-sized
@@ -211,8 +226,16 @@ pub(crate) fn stroke_text<'a>(
                 css_font_size,
             };
             let run_node_id = style.brush.id;
-            let run_x0 = glyph_run.offset() as f64;
-            let run_x1 = run_x0 + glyph_run.advance() as f64;
+            let mut run_x0 = glyph_run.offset() as f64;
+            let mut run_x1 = run_x0 + glyph_run.advance() as f64;
+            // On a truncated line, decorations stop at the cut (the marker itself is
+            // undecorated, as in Chrome).
+            if let Some(cut) = cut {
+                let Some((x0, x1)) = cut.clamp(run_x0 as f32, run_x1 as f32) else {
+                    continue;
+                };
+                (run_x0, run_x1) = (x0 as f64, x1 as f64);
+            }
 
             for entry in stack.iter() {
                 if entry.decoration.is_none() {
@@ -257,12 +280,13 @@ pub(crate) fn stroke_text<'a>(
                 transform,
                 options,
                 inline_root_id,
+                cut,
             );
         }
 
         // Pass 3: the glyphs themselves.
         for (glyph_run, record) in glyph_runs(&line).zip(run_records.iter()) {
-            draw_glyph_run(scene, &glyph_run, record.fill_color, transform);
+            draw_glyph_run(scene, &glyph_run, record.fill_color, transform, cut);
         }
 
         // Pass 4: decorations, on top of the glyphs.
@@ -275,6 +299,80 @@ pub(crate) fn stroke_text<'a>(
             inline_root_id,
             line.metrics().baseline,
             None,
+        );
+
+        // Pass 5: the `text-overflow` marker, after the glyphs that were kept.
+        if let (Some(cut), Some((overflow, _))) = (cut, text_overflow) {
+            draw_text_overflow_marker(
+                scene,
+                doc,
+                transform,
+                options,
+                overflow,
+                cut,
+                line.metrics().baseline,
+            );
+        }
+    }
+}
+
+/// Draw the `text-overflow` marker of a truncated line at its cut. The marker is the
+/// block's (css-overflow §5.2): its own font(s), size, synthesis and colour, on the line's
+/// baseline.
+fn draw_text_overflow_marker(
+    scene: &mut impl PaintScene,
+    doc: &BaseDocument,
+    transform: Affine,
+    options: TextPaintOptions,
+    overflow: &TextOverflowLayout<TextBrush>,
+    cut: Cut,
+    baseline: f32,
+) {
+    let marker = &overflow.marker;
+    let color = options.brush_override.unwrap_or_else(|| {
+        doc.get_node(marker.brush.id)
+            .and_then(|node| node.primary_styles())
+            .map(|styles| {
+                let itext = styles.get_inherited_text();
+                itext
+                    ._webkit_text_fill_color
+                    .resolve_to_absolute(&itext.color)
+                    .as_srgb_color()
+            })
+            .unwrap_or(Color::BLACK)
+    });
+    if color.components[3] <= 0.0 {
+        return;
+    }
+    for run in &marker.runs {
+        if run.font_size <= 0.0 {
+            continue;
+        }
+        let glyph_xform = run
+            .skew
+            .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
+        let embolden = if FONT_EMBOLDEN_ENABLED {
+            font_embolden(run.font_size as f64, color, transform)
+        } else {
+            kurbo::Vec2::default()
+        };
+        scene.draw_glyphs(
+            &run.font,
+            run.font_size,
+            !FONT_EMBOLDEN_ENABLED,
+            &run.normalized_coords,
+            embolden,
+            Fill::NonZero,
+            &anyrender::Paint::from(color),
+            1.0,
+            transform,
+            glyph_xform,
+            run.glyphs.iter().map(|&(id, x)| anyrender::Glyph {
+                id: id as _,
+                x: cut.marker_x + x,
+                y: baseline,
+            }),
+            AntiAliasing::Enabled,
         );
     }
 }
@@ -289,12 +387,14 @@ pub(crate) fn glyph_runs<'a, 'b>(
     })
 }
 
-/// Draw a glyph run's glyphs in a single colour.
+/// Draw a glyph run's glyphs in a single colour, leaving out those that a `text-overflow`
+/// cut hides.
 pub(crate) fn draw_glyph_run(
     scene: &mut impl PaintScene,
     glyph_run: &GlyphRun<'_, TextBrush>,
     color: Color,
     transform: Affine,
+    cut: Option<Cut>,
 ) {
     let run = glyph_run.run();
     let font_size = run.font_size();
@@ -326,11 +426,24 @@ pub(crate) fn draw_glyph_run(
         1.0,
         transform,
         glyph_xform,
-        glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
-            id: glyph.id as _,
-            x: glyph.x,
-            y: glyph.y,
-        }),
+        {
+            // This compares the pen position rather than `glyph.x` so that a glyph's own
+            // offset (e.g. a combining mark) cannot move it across the cut independently of
+            // its cluster.
+            let mut pen = glyph_run.offset();
+            glyph_run.positioned_glyphs().filter_map(move |glyph| {
+                let start = pen;
+                pen += glyph.advance;
+                if cut.is_some_and(|cut| cut.hides(start, pen)) {
+                    return None;
+                }
+                Some(anyrender::Glyph {
+                    id: glyph.id as _,
+                    x: glyph.x,
+                    y: glyph.y,
+                })
+            })
+        },
         AntiAliasing::Enabled,
     );
 }

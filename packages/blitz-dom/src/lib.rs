@@ -52,6 +52,12 @@ mod iframe;
 /// Integration of taffy and the DOM.
 mod layout;
 mod mutator;
+/// `text-overflow` data computed after layout and consumed by painters.
+pub mod text_overflow {
+    pub use crate::layout::inline::text_overflow::{
+        Cut, Marker, MarkerRun, TextOverflowLayout, TruncatedLine, resolve,
+    };
+}
 mod query_selector;
 mod resolve;
 /// Computation of resolved CSS property values (`getComputedStyle()`)
