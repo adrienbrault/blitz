@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>text-overflow</title>
+<style>
+  body { font-family: sans-serif; font-size: 16px; margin: 16px; background: #fff; color: #222; }
+  .row { display: flex; align-items: baseline; gap: 12px; margin: 0 0 10px; }
+  .label { width: 190px; flex: none; font: 12px monospace; color: #777; }
+  .box { width: 220px; border: 1px solid #bbb; padding: 2px 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .clip { text-overflow: clip; }
+  .string { text-overflow: "[more]"; }
+  .rtl { direction: rtl; }
+  .narrow { width: 12px; }
+  .big { font-size: 28px; }
+  .ib { display: inline-block; width: 40px; height: 12px; background: #4a90e2; }
+  .pre { white-space: pre; }
+</style>
+</head>
+<body>
+  <div class="row"><span class="label">ellipsis, overflowing</span><div class="box">The quick brown fox jumps over the lazy dog</div></div>
+  <div class="row"><span class="label">clip, overflowing</span><div class="box clip">The quick brown fox jumps over the lazy dog</div></div>
+  <div class="row"><span class="label">ellipsis, fits</span><div class="box">Short text fits</div></div>
+  <div class="row"><span class="label">string marker</span><div class="box string">The quick brown fox jumps over the lazy dog</div></div>
+  <div class="row"><span class="label">styled spans + underline</span><div class="box">Plain, <b style="color:#c0392b">bold red</b> and <u>underlined text that runs past the edge</u></div></div>
+  <div class="row"><span class="label">30px span in 16px block</span><div class="box">Small <span class="big">LARGE TEXT HERE</span></div></div>
+  <div class="row"><span class="label">inline-block past cut</span><div class="box">Text before box text <span class="ib"></span> after</div></div>
+  <div class="row"><span class="label">rtl block</span><div class="box rtl">שלום עולם, זהו טקסט ארוך מאוד שחורג מהקופסה</div></div>
+  <div class="row"><span class="label">narrower than one char</span><div class="box narrow">Wide</div></div>
+  <div class="row"><span class="label">pre, two long lines</span><div class="box pre">first line, which is far too long to fit
+and a second line that is also far too long</div></div>
+</body>
+</html>
