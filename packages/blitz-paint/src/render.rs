@@ -6,7 +6,7 @@ mod form_controls;
 mod mask;
 
 use blitz_dom::CopyStyleGetters;
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -18,15 +18,18 @@ use crate::filters::convert_filters;
 use crate::kurbo_css::NonUniformRoundedRectRadii;
 use crate::layers::LayerManager;
 use crate::sizing::compute_object_fit;
-use crate::text::{DrawTextContext, TextPaintOptions};
+use crate::text::{DrawTextContext, TextOverflowCuts, TextPaintOptions};
 use crate::{CustomWidgetSceneMap, SELECTION_COLOR};
 use anyrender::{AntiAliasing, PaintScene, Scene};
 use blitz_dom::node::{
     ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, TextInputData,
     TextNodeData,
 };
+use blitz_dom::text_overflow::{self, Cut};
 use blitz_dom::{BaseDocument, ElementData, Node, NodeId, local_name};
 use blitz_traits::devtools::DevtoolSettings;
+use parley::{InlineBoxKind, PositionedLayoutItem};
+use smallvec::SmallVec;
 
 use style::values::computed::{BorderCornerRadius, ColorOrAuto};
 use style::{
@@ -411,6 +414,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     },
                     node.id,
                     &mut self.draw_text_context.borrow_mut(),
+                    cx.text_overflow(),
                 );
             }
         }
@@ -813,6 +817,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             list_item: element.list_item_data.as_deref(),
             devtools: self.dom.devtools(),
             custom_widget_scene,
+            text_overflow_cuts: OnceCell::new(),
         }
     }
 }
@@ -867,6 +872,8 @@ struct ElementCx<'dom, 'a> {
     devtools: &'dom DevtoolSettings,
     #[cfg_attr(not(feature = "custom-widget"), expect(unused))]
     custom_widget_scene: Option<&'a Scene>,
+    /// See [`ElementCx::text_overflow_cuts`].
+    text_overflow_cuts: OnceCell<Vec<(usize, Cut)>>,
 }
 
 /// Converts parley BoundingBox into peniko Rect
@@ -875,6 +882,99 @@ fn convert_rect(rect: &parley::BoundingBox) -> kurbo::Rect {
 }
 
 impl ElementCx<'_, '_> {
+    /// This inline root's `text-overflow` record and the lines it cuts, as
+    /// [`crate::text::stroke_text`] takes them. `None` if nothing is cut.
+    fn text_overflow(&self) -> Option<TextOverflowCuts<'_>> {
+        let overflow = self
+            .element
+            .inline_layout_data
+            .as_ref()?
+            .overflow
+            .as_deref()?;
+        let cuts = self.text_overflow_cuts();
+        (!cuts.is_empty()).then_some((overflow, cuts))
+    }
+
+    /// Where `text-overflow` cuts each truncated line of this inline root at the current scroll
+    /// position, as `(line index, cut)` in line order. Empty if nothing is cut. Resolved once per
+    /// paint of this element.
+    fn text_overflow_cuts(&self) -> &[(usize, Cut)] {
+        self.text_overflow_cuts
+            .get_or_init(|| self.resolve_text_overflow_cuts())
+    }
+
+    fn resolve_text_overflow_cuts(&self) -> Vec<(usize, Cut)> {
+        let Some(text_layout) = self.element.inline_layout_data.as_ref() else {
+            return Vec::new();
+        };
+        let Some(overflow) = text_layout.overflow.as_deref() else {
+            return Vec::new();
+        };
+        let dom = self.context.dom;
+
+        // The clipping box (the parent for an anonymous root): its horizontal scroll moves the
+        // cut.
+        let block = if self.node.is_anonymous() {
+            self.node.parent.and_then(|p| dom.get_node(p))
+        } else {
+            Some(self.node)
+        };
+        // A focused editing host is being edited: treat `ellipsis` as `clip` (css-overflow §5.2,
+        // "user interaction with ellipsis") so the marker never hides the caret's text.
+        let editing = block.is_some_and(|b| {
+            dom.get_focussed_node_id() == Some(b.id)
+                && b.attr(local_name!("contenteditable"))
+                    .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+        });
+        if editing {
+            return Vec::new();
+        }
+        let scroll_x = block
+            .map(|n| (n.scroll_offset().x * self.scale) as f32)
+            .unwrap_or(0.0);
+
+        overflow
+            .lines
+            .iter()
+            .filter_map(|truncated| {
+                let line = text_layout.layout.get(truncated.line_index)?;
+                let cut = text_overflow::resolve(
+                    overflow,
+                    &text_layout.layout,
+                    truncated,
+                    &line,
+                    scroll_x,
+                )?;
+                Some((truncated.line_index, cut))
+            })
+            .collect()
+    }
+
+    /// The inline boxes of this inline root that `text-overflow` hides.
+    fn text_overflow_hidden_boxes(&self) -> SmallVec<[NodeId; 8]> {
+        let mut hidden = SmallVec::new();
+        let Some(text_layout) = self.element.inline_layout_data.as_ref() else {
+            return hidden;
+        };
+        if text_layout.overflow.is_none() || text_layout.layout.inline_boxes().len() == 0 {
+            return hidden;
+        }
+        for &(line_index, cut) in self.text_overflow_cuts() {
+            let Some(line) = text_layout.layout.get(line_index) else {
+                continue;
+            };
+            for item in line.items() {
+                if let PositionedLayoutItem::InlineBox(ibox) = item
+                    && ibox.kind == InlineBoxKind::InFlow
+                    && cut.hides(ibox.x, ibox.x + ibox.width)
+                {
+                    hidden.push(NodeId::from_u64(ibox.id));
+                }
+            }
+        }
+        hidden
+    }
+
     /// Paint overlay scrollbar thumbs for scroll containers: `overflow:
     /// scroll`, or `auto` when the content overflows (never `hidden`/`clip`,
     /// which scroll only programmatically). Thumbs appear on scroll and fade
@@ -1042,7 +1142,8 @@ impl ElementCx<'_, '_> {
                 );
             }
 
-            // Render text
+            // Render text, cut where `text-overflow` truncates a line. Inline backgrounds above
+            // are deliberately not cut: as in Chrome, they run on underneath the marker.
             let mut draw_text_context = self.context.draw_text_context.borrow_mut();
             crate::text::stroke_text(
                 scene,
@@ -1055,6 +1156,7 @@ impl ElementCx<'_, '_> {
                 },
                 self.node.id,
                 &mut draw_text_context,
+                self.text_overflow(),
             );
         }
     }
@@ -1127,6 +1229,7 @@ impl ElementCx<'_, '_> {
                 },
                 self.node.id,
                 &mut draw_text_context,
+                None,
             );
         }
     }
@@ -1186,6 +1289,7 @@ impl ElementCx<'_, '_> {
                 },
                 self.node.id,
                 &mut draw_text_context,
+                None,
             );
         }
     }
@@ -1216,7 +1320,15 @@ impl ElementCx<'_, '_> {
 
         // Regular children
         if let Some(children) = &*self.node.paint_children.borrow() {
+            let hidden_boxes = if self.node.flags.is_inline_root() {
+                self.text_overflow_hidden_boxes()
+            } else {
+                SmallVec::new()
+            };
             for child_id in children {
+                if hidden_boxes.contains(child_id) {
+                    continue;
+                }
                 // Fixed-position children of the root element are positioned against
                 // the viewport and do not scroll with it, so cancel out the viewport
                 // scroll (applied in `paint_scene`). A fixed box contained by a

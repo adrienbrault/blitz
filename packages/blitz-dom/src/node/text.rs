@@ -37,6 +37,9 @@ pub struct TextLayout {
     /// `final_layout`. Paint draws text from the unrounded origin so that it keeps its sub-pixel
     /// position while box edges stay snapped. Set by the `writing-mode` layout pass; zero otherwise.
     pub content_box_subpixel_offset: taffy::Point<f32>,
+    /// Lines truncated by `text-overflow`, computed after line breaking and consumed by the
+    /// painter. `None` when no line needs a marker.
+    pub overflow: Option<Box<crate::text_overflow::TextOverflowLayout<TextBrush>>>,
 }
 
 impl TextLayout {

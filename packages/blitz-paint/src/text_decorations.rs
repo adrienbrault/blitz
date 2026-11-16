@@ -15,6 +15,7 @@ use style::values::generics::text::{GenericTextDecorationInset, GenericTextDecor
 
 use crate::color::{Color, ToColorColor as _};
 use crate::text::{RunRecord, TextPaintOptions, draw_glyph_run, glyph_run_rect, glyph_runs};
+use blitz_dom::text_overflow::Cut;
 
 /// Per-font-face cache of the OS/2 `usWinAscent / unitsPerEm` ratio, keyed by the font
 /// blob's unique id and face index. `None` is cached for fonts without a usable OS/2 or
@@ -645,6 +646,7 @@ pub(crate) fn draw_line_text_shadows(
     transform: Affine,
     options: TextPaintOptions,
     inline_root_id: NodeId,
+    cut: Option<Cut>,
 ) {
     let line_metrics = line.metrics();
     let line_baseline = line_metrics.baseline;
@@ -716,7 +718,7 @@ pub(crate) fn draw_line_text_shadows(
 
             let shadow_transform = transform * Affine::translate(shadow.offset);
             for run in batch() {
-                draw_glyph_run(scene, &run, shadow.color, shadow_transform);
+                draw_glyph_run(scene, &run, shadow.color, shadow_transform, cut);
             }
             if has_decorations {
                 flush_line_decorations(
