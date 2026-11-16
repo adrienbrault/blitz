@@ -621,7 +621,6 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 
         let paints_own_box = !node.is_inline_with_only_block_children();
 
-        cx.draw_outline(scene);
         if paints_own_box {
             cx.draw_outset_box_shadow(scene);
         }
@@ -745,6 +744,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 cx.maybe_pop_css_mask_layer(scene, mask_layer_pushed);
             },
         );
+
+        // Outlines are drawn over the element's content, so that one set into the border box
+        // with a negative `outline-offset` isn't hidden by its background
+        cx.draw_outline(scene);
 
         self.layer_manager
             .maybe_pop_layer(scene, blend_layer_pushed);
