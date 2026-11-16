@@ -395,10 +395,8 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         if node.flags.is_inline_root() {
             if let Some(layout) = &cx.element.inline_layout_data {
                 let layout_box = node.final_layout();
-                let x = (layout_box.padding.left + layout_box.border.left) as f64
-                    - node.scroll_offset().x;
+                let x = (layout_box.padding.left + layout_box.border.left) as f64;
                 let y = (layout_box.padding.top + layout_box.border.top) as f64
-                    - node.scroll_offset().y
                     + layout.block_offset as f64;
                 let text_transform =
                     transform * Affine::translate((x * self.scale, y * self.scale));
@@ -709,12 +707,9 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                             None,
                             None,
                             |scene| {
-                                // Now that background has been drawn, offset pos and cx in order to draw our contents scrolled
-                                let content_position = Point {
-                                    x: content_position.x - node.scroll_offset().x,
-                                    y: content_position.y - node.scroll_offset().y,
-                                };
-
+                                // Now that background has been drawn, offset cx in order to draw our contents
+                                // scrolled. `content_position` is applied on top of `cx.transform`, so it must
+                                // not be offset as well.
                                 cx.transform = self.scrolled_transform(node, cx.transform);
                                 cx.draw_image(scene);
                                 #[cfg(feature = "svg")]
