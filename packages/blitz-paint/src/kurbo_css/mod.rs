@@ -34,6 +34,8 @@ pub(crate) enum Corner {
 #[allow(clippy::enum_variant_names, reason = "Use CSS standard terminology")]
 pub(crate) enum CssBoxKind {
     OutlineBox,
+    /// The inner edge of the outline, which is the border box unless `outline-offset` is set
+    OutlineInnerBox,
     BorderBox,
     PaddingBox,
     ContentBox,
