@@ -621,7 +621,6 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 
         let paints_own_box = !node.is_inline_with_only_block_children();
 
-        cx.draw_outline(scene);
         if paints_own_box {
             cx.draw_outset_box_shadow(scene);
         }
@@ -745,6 +744,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 cx.maybe_pop_css_mask_layer(scene, mask_layer_pushed);
             },
         );
+
+        // Outlines are drawn over the element's content, so that one set into the border box
+        // with a negative `outline-offset` isn't hidden by its background
+        cx.draw_outline(scene);
 
         self.layer_manager
             .maybe_pop_layer(scene, blend_layer_pushed);
@@ -1526,7 +1529,9 @@ fn create_css_rect(style: &ComputedValues, layout: &Layout, scale: f64) -> CssBo
     let border_box = Rect::new(0.0, 0.0, width * scale, height * scale);
     let border = insets_from_taffy_rect(layout.border.map(|p| p as f64 * scale));
     let padding = insets_from_taffy_rect(layout.padding.map(|p| p as f64 * scale));
-    let outline_width = style.get_outline().outline_width.0.to_f64_px() * scale;
+    let outline = style.get_outline();
+    let outline_width = outline.outline_width.0.to_f64_px() * scale;
+    let outline_offset = outline.outline_offset.to_f64_px() * scale;
 
     // Resolve the radii to a length. need to downscale since the radii are in document pixels
     let resolve_w = CSSPixelLength::new(width as _);
@@ -1545,5 +1550,12 @@ fn create_css_rect(style: &ComputedValues, layout: &Layout, scale: f64) -> CssBo
         bottom_left: resolve_radii(&s_border.border_bottom_left_radius),
     };
 
-    CssBox::new(border_box, border, padding, outline_width, border_radii)
+    CssBox::new(
+        border_box,
+        border,
+        padding,
+        outline_width,
+        outline_offset,
+        border_radii,
+    )
 }

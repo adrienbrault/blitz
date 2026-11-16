@@ -35,6 +35,7 @@ pub struct CssBox {
     pub border_width: Insets,
     pub padding_width: Insets,
     pub outline_width: f64,
+    pub outline_offset: f64,
 
     /// Outer (border-box) radii, already scaled down so adjacent corners don't overlap.
     pub border_radii: NonUniformRoundedRectRadii,
@@ -46,6 +47,7 @@ impl CssBox {
         border: Insets,
         padding: Insets,
         outline_width: f64,
+        outline_offset: f64,
         mut border_radii: NonUniformRoundedRectRadii,
     ) -> Self {
         // Correct the border radii if they are too big if two border radii would intersect, then we need to shrink
@@ -75,6 +77,7 @@ impl CssBox {
             border_width: border,
             padding_width: padding,
             outline_width,
+            outline_offset,
             border_radii,
         }
     }
@@ -87,13 +90,37 @@ impl CssBox {
         self.padding_box() - self.padding_width
     }
 
+    /// The outer edge of the outline
     pub fn outline_box(&self) -> Rect {
-        self.border_box.inset(self.outline_width)
+        let offset = self.outline_offset_xy();
+        self.border_box.inset(Insets::uniform_xy(
+            offset.x + self.outline_width,
+            offset.y + self.outline_width,
+        ))
+    }
+
+    /// The inner edge of the outline: the border box moved out by `outline-offset` (or in, if
+    /// the offset is negative)
+    pub fn outline_inner_box(&self) -> Rect {
+        let offset = self.outline_offset_xy();
+        self.border_box
+            .inset(Insets::uniform_xy(offset.x, offset.y))
+    }
+
+    /// The `outline-offset` to use on each axis. A negative offset shrinks the inner edge of the
+    /// outline at most down to the centre line of the border box, so that the outer edge is never
+    /// smaller than twice the outline width, independently in each dimension, as CSS UI 4 asks.
+    fn outline_offset_xy(&self) -> Vec2 {
+        Vec2::new(
+            self.outline_offset.max(-self.border_box.width() / 2.0),
+            self.outline_offset.max(-self.border_box.height() / 2.0),
+        )
     }
 
     fn rect(&self, kind: CssBoxKind) -> Rect {
         match kind {
             CssBoxKind::OutlineBox => self.outline_box(),
+            CssBoxKind::OutlineInnerBox => self.outline_inner_box(),
             CssBoxKind::BorderBox => self.border_box,
             CssBoxKind::PaddingBox => self.padding_box(),
             CssBoxKind::ContentBox => self.content_box(),
@@ -205,6 +232,7 @@ impl CssBox {
             slice_border,
             Insets::ZERO,
             0.0,
+            0.0,
             slice_radii,
         )
     }
@@ -215,10 +243,14 @@ impl CssBox {
 
         // TODO: this has been known to produce quirky outputs with hugely rounded edges
         self.shape(&mut path, CssBoxKind::OutlineBox, Direction::Clockwise);
-        path.move_to(self.corner(Corner::TopLeft, CssBoxKind::BorderBox));
+        path.move_to(self.corner(Corner::TopLeft, CssBoxKind::OutlineInnerBox));
 
-        self.shape(&mut path, CssBoxKind::BorderBox, Direction::Anticlockwise);
-        path.move_to(self.corner(Corner::TopLeft, CssBoxKind::BorderBox));
+        self.shape(
+            &mut path,
+            CssBoxKind::OutlineInnerBox,
+            Direction::Anticlockwise,
+        );
+        path.move_to(self.corner(Corner::TopLeft, CssBoxKind::OutlineInnerBox));
 
         path
     }
@@ -522,7 +554,11 @@ impl CssBox {
         }
 
         let css_box: Insets = match side {
-            OutlineBox => return false,
+            // The outline's radii shrink with a negative offset, possibly down to zero
+            OutlineBox | OutlineInnerBox => {
+                let (_, radii) = self.ellipse(corner, side);
+                return radii.x <= 0.0 || radii.y <= 0.0;
+            }
             BorderBox => return false,
             PaddingBox => self.border_width,
             ContentBox => add_insets(self.border_width, self.padding_width),
@@ -563,6 +599,29 @@ impl CssBox {
             BottomRight => border_radii.bottom_right,
         };
 
+        let radii: Vec2 = match side {
+            OutlineBox => self.outline_radii(corner_radii, self.outline_width),
+            OutlineInnerBox => self.outline_radii(corner_radii, 0.0),
+            BorderBox => corner_radii,
+            PaddingBox => corner_radii - get_corner_insets(*border_width, corner),
+            ContentBox => {
+                corner_radii - get_corner_insets(add_insets(*border_width, *padding_width), corner)
+            }
+        };
+
+        // Radii floored at zero no longer share the border box's centres, so place the
+        // outline's corners from its own edges instead
+        if let OutlineBox | OutlineInnerBox = side {
+            let Rect { x0, y0, x1, y1 } = self.rect(side);
+            let center = match corner {
+                TopLeft => Point::new(x0 + radii.x, y0 + radii.y),
+                TopRight => Point::new(x1 - radii.x, y0 + radii.y),
+                BottomLeft => Point::new(x0 + radii.x, y1 - radii.y),
+                BottomRight => Point::new(x1 - radii.x, y1 - radii.y),
+            };
+            return (center, radii);
+        }
+
         let center = match corner {
             TopLeft => corner_radii,
             TopRight => Vec2 {
@@ -579,16 +638,18 @@ impl CssBox {
             },
         };
 
-        let radii: Vec2 = match side {
-            BorderBox => corner_radii,
-            OutlineBox => corner_radii + Vec2::new(self.outline_width, self.outline_width),
-            PaddingBox => corner_radii - get_corner_insets(*border_width, corner),
-            ContentBox => {
-                corner_radii - get_corner_insets(add_insets(*border_width, *padding_width), corner)
-            }
-        };
-
         (border_box.origin() + center, radii)
+    }
+
+    /// The radii of an outline edge `outline-offset` + `width` away from a border box corner:
+    /// the corner's radii grow by that distance, or shrink for a negative offset, but never
+    /// below zero
+    fn outline_radii(&self, corner_radii: Vec2, width: f64) -> Vec2 {
+        let offset = self.outline_offset_xy();
+        Vec2 {
+            x: (corner_radii.x + offset.x + width).max(0.0),
+            y: (corner_radii.y + offset.y + width).max(0.0),
+        }
     }
 
     fn start_angle(&self, corner: Corner, radii: Vec2) -> f64 {
@@ -710,6 +771,7 @@ mod tests {
             Insets::uniform(10.0),
             Insets::ZERO,
             0.0,
+            0.0,
             NonUniformRoundedRectRadii {
                 top_left: Vec2::new(60.0, 20.0),
                 top_right: Vec2::new(20.0, 50.0), // ry > rx
@@ -804,6 +866,7 @@ fn detects_elliptical_border() {
             Insets::uniform(1.0),
             Insets::ZERO,
             0.0,
+            0.0,
             radii,
         )
     };
@@ -831,6 +894,7 @@ fn detects_uniform_corner_border() {
             Rect::new(0.0, 0.0, w, h),
             Insets::uniform(1.0),
             Insets::ZERO,
+            0.0,
             0.0,
             radii,
         )
@@ -869,6 +933,7 @@ fn derives_nested_boxes_and_clamps_radii() {
         Insets::new(1.0, 2.0, 3.0, 4.0),
         Insets::uniform(5.0),
         2.0,
+        0.0,
         NonUniformRoundedRectRadii {
             top_left: Vec2::new(100.0, 10.0),
             top_right: Vec2::new(100.0, 10.0),
@@ -888,8 +953,100 @@ fn derives_nested_boxes_and_clamps_radii() {
         Insets::ZERO,
         Insets::ZERO,
         0.0,
+        0.0,
         NonUniformRoundedRectRadii::default(),
     );
     assert_eq!(sharp.border_radii, NonUniformRoundedRectRadii::default());
     assert!(!sharp.has_border_radius());
+}
+
+#[test]
+fn outline_offset_moves_the_outline() {
+    let css_box = |outline_width: f64, outline_offset: f64, top_left_radius: f64| {
+        CssBox::new(
+            Rect::new(0.0, 0.0, 100.0, 50.0),
+            Insets::uniform(1.0),
+            Insets::ZERO,
+            outline_width,
+            outline_offset,
+            NonUniformRoundedRectRadii {
+                top_left: Vec2::new(top_left_radius, top_left_radius),
+                ..Default::default()
+            },
+        )
+    };
+    let edges = |b: &CssBox| (b.outline_box(), b.outline_inner_box());
+    let radii = |b: &CssBox, kind: CssBoxKind| b.box_shape(kind).radii.top_left;
+    // The path that paints the outline reaches out to its outer edge, and no further
+    let assert_path_fills_outline_box = |b: &CssBox| {
+        let (path, expected) = (b.outline().bounding_box(), b.outline_box());
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(
+            near(path.x0, expected.x0)
+                && near(path.y0, expected.y0)
+                && near(path.x1, expected.x1)
+                && near(path.y1, expected.y1),
+            "outline path bounds {path:?} != outline box {expected:?}"
+        );
+    };
+
+    // Without an offset the outline hugs the border box, as before
+    let b = css_box(2.0, 0.0, 0.0);
+    assert_eq!(
+        edges(&b),
+        (Rect::new(-2.0, -2.0, 102.0, 52.0), b.border_box)
+    );
+
+    // A positive offset leaves a gap between the border box and the outline
+    let b = css_box(2.0, 4.0, 0.0);
+    assert_eq!(
+        edges(&b),
+        (
+            Rect::new(-6.0, -6.0, 106.0, 56.0),
+            Rect::new(-4.0, -4.0, 104.0, 54.0)
+        )
+    );
+    assert_path_fills_outline_box(&b);
+
+    // A negative offset draws the outline inside the border box
+    let b = css_box(2.0, -6.0, 0.0);
+    assert_eq!(
+        edges(&b),
+        (
+            Rect::new(4.0, 4.0, 96.0, 46.0),
+            Rect::new(6.0, 6.0, 94.0, 44.0)
+        )
+    );
+
+    // A large negative offset collapses the inner edge onto the centre line of the border box
+    // in each dimension independently, so the outline is never smaller than twice its width
+    let b = css_box(2.0, -40.0, 0.0);
+    assert_eq!(
+        edges(&b),
+        (
+            Rect::new(38.0, 23.0, 62.0, 27.0),
+            Rect::new(40.0, 25.0, 60.0, 25.0)
+        )
+    );
+    assert_path_fills_outline_box(&b);
+
+    // Rounded corners grow with a positive offset, and sharp corners stay sharp
+    let b = css_box(2.0, 4.0, 10.0);
+    assert_eq!(radii(&b, CssBoxKind::OutlineBox), Vec2::new(16.0, 16.0));
+    assert_eq!(
+        radii(&b, CssBoxKind::OutlineInnerBox),
+        Vec2::new(14.0, 14.0)
+    );
+    let shape = b.box_shape(CssBoxKind::OutlineBox);
+    assert_eq!(shape.radii.top_right, Vec2::ZERO);
+    assert_eq!(shape.radii.bottom_right, Vec2::ZERO);
+
+    // ... and shrink with a negative one, down to a sharp corner
+    let b = css_box(2.0, -7.0, 10.0);
+    assert_eq!(radii(&b, CssBoxKind::OutlineBox), Vec2::new(5.0, 5.0));
+    assert_eq!(radii(&b, CssBoxKind::OutlineInnerBox), Vec2::new(3.0, 3.0));
+    let b = css_box(2.0, -11.0, 10.0);
+    assert_eq!(radii(&b, CssBoxKind::OutlineBox), Vec2::new(1.0, 1.0));
+    assert_eq!(radii(&b, CssBoxKind::OutlineInnerBox), Vec2::ZERO);
+    assert_path_fills_outline_box(&b);
 }
